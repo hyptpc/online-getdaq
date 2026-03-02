@@ -38,9 +38,11 @@ class EventDisplay {
  public:
   EventDisplay(const TGWindow *p, UInt_t w, UInt_t h, Int_t runNum = -1, Int_t eventNum = 1);
   virtual ~EventDisplay();
+  uint32_t FindLastEventId(std::ifstream& fin, bool verbose=false);
   void LoadEventData(long runNum, long eventNum);
   void GoForward();
   void GoBackward();
+  void GoLast();
   void GoTo();
   void ShowPulse();
   void DoCanvasDraw();
@@ -50,7 +52,7 @@ class EventDisplay {
   TTree *tree;
   TGMainFrame *fMain;
   TRootEmbeddedCanvas *fECanvas;
-  TGButton *pre_Button, *next_Button, *go_Button;
+  TGButton *pre_Button, *next_Button, *go_Button, *last_Button;
   TGTextEntry *fEvtHandler;
   TPaveText *fDef;
 
@@ -253,6 +255,10 @@ EventDisplay::EventDisplay(const TGWindow* p, UInt_t w, UInt_t h, Int_t runNum, 
   next_Button->Connect("Clicked()","EventDisplay",this,"GoForward()");
   hframe->AddFrame(next_Button, new TGLayoutHints(kLHintsCenterX ,5,5,3,4));
 
+  last_Button = new TGTextButton(hframe, "&Last",1);
+  last_Button->Connect("Clicked()","EventDisplay",this,"GoLast()");
+  hframe->AddFrame(last_Button, new TGLayoutHints(kLHintsCenterX ,5,5,3,4));
+
 
   fEvtHandler = new TGTextEntry(hframe);
   fEvtHandler ->SetEnabled(true);
@@ -271,7 +277,7 @@ EventDisplay::EventDisplay(const TGWindow* p, UInt_t w, UInt_t h, Int_t runNum, 
 
 
   fMain->AddFrame(hframe, new TGLayoutHints(kLHintsCenterX,2,2,2,2));
-  fMain->SetWindowName(Form("HypTPC Event Display | Last Event : %d",fLastEntry));
+  fMain->SetWindowName(Form("HypTPC Event Display"));
   fMain->MapSubwindows();
   fMain->Resize(fMain->GetDefaultSize());
   fMain->MapWindow();
@@ -285,339 +291,431 @@ EventDisplay::~EventDisplay() {
   delete fMain;
 }
 
+struct SkipInfo {
+  uint32_t eventId = 0;
+  uint32_t dataBytes = 0;
+  bool ok = false;
+};
 
+static SkipInfo calcSkipFromHeader(const GetHeader_t& h) {
+  SkipInfo s;
+
+  const int asadId = (int)h.m_AsadIdx;
+  (void)asadId;
+
+  const uint32_t n_words = (uint32_t)h.m_nItems[0] * (uint32_t)std::pow(16, 6)
+    + (uint32_t)h.m_nItems[1] * (uint32_t)std::pow(16, 4)
+    + (uint32_t)h.m_nItems[2] * (uint32_t)std::pow(16, 2)
+    + (uint32_t)h.m_nItems[3] * (uint32_t)std::pow(16, 0);
+
+  const uint32_t eventNumber = (uint32_t)h.m_EventIdx[0] * (uint32_t)std::pow(16, 6)
+    + (uint32_t)h.m_EventIdx[1] * (uint32_t)std::pow(16, 4)
+    + (uint32_t)h.m_EventIdx[2] * (uint32_t)std::pow(16, 2)
+    + (uint32_t)h.m_EventIdx[3] * (uint32_t)std::pow(16, 0);
+
+  const uint32_t frameSize  = (uint32_t)h.m_FrameSize[0] * (uint32_t)std::pow(16, 4)
+    + (uint32_t)h.m_FrameSize[1] * (uint32_t)std::pow(16, 2)
+    + (uint32_t)h.m_FrameSize[2] * (uint32_t)std::pow(16, 0);
+
+  const uint32_t headerSize = (uint32_t)h.m_HeaderSize[0] * (uint32_t)std::pow(16, 2)
+    + (uint32_t)h.m_HeaderSize[1] * (uint32_t)std::pow(16, 0);
+
+  const uint32_t item_size  = (uint32_t)h.m_ItemSize[0] * (uint32_t)std::pow(16, 2)
+    + (uint32_t)h.m_ItemSize[1] * (uint32_t)std::pow(16, 0);
+
+  const int64_t padded = (int64_t)( (int64_t)(frameSize) - (int64_t)(headerSize) ) * 256LL
+    - (int64_t)item_size * (int64_t)n_words;
+
+  if (frameSize == 0 || item_size == 0) return s;
+  if (padded < 0) return s;
+
+  const uint64_t dataBytes = (uint64_t)item_size * (uint64_t)n_words + (uint64_t)padded;
+
+  if (dataBytes > (1ULL<<30)) return s;
+
+  s.eventId = eventNumber;
+  s.dataBytes = (uint32_t)dataBytes;
+  s.ok = true;
+  return s;
+}
+
+uint32_t EventDisplay::FindLastEventId(std::ifstream& fin, bool verbose=false) {
+  fin.clear();
+  fin.seekg(0, std::ios::end);
+  const std::streamoff fileSize = fin.tellg();
+  fin.clear();
+  fin.seekg(12, std::ios::beg);
+
+  uint32_t lastEvent = 0;
+  size_t nrec = 0;
+
+  while (true) {
+    const std::streamoff pos = fin.tellg();
+    if (pos < 0) break;
+    if (fileSize - pos < (std::streamoff)sizeof(GetHeader_t)) break;
+
+    GetHeader_t h;
+    fin.read(reinterpret_cast<char*>(&h), sizeof(h));
+    if (!fin) break;
+
+    const auto s = calcSkipFromHeader(h);
+    if (!s.ok) {
+      if (verbose) {
+	std::cerr << "[findLastEventId] header sanity check failed at pos="
+                  << (long long)pos << " (0x" << std::hex << (long long)pos << std::dec << ")\n";
+      }
+      break;
+    }
+
+    lastEvent = s.eventId;
+    ++nrec;
+
+    fin.seekg((std::streamoff)s.dataBytes, std::ios::cur);
+    if (!fin) break;
+  }
+
+  if (verbose) {
+    std::cerr << "[findLastEventId] scanned records=" << nrec
+              << ", lastEventId=" << lastEvent << "\n";
+  }
+
+  return lastEvent;
+}
+
+bool ReadHeader(std::ifstream& fin, GetHeader_t& h) {
+  fin.read(reinterpret_cast<char*>(&h), sizeof(h));
+  return (bool)fin;
+}
+
+unsigned long GetEventId(const GetHeader_t& h) {
+  return (unsigned long)(
+			 (int)h.m_EventIdx[0]*pow(16,6) +
+			 (int)h.m_EventIdx[1]*pow(16,4) +
+			 (int)h.m_EventIdx[2]*pow(16,2) +
+			 (int)h.m_EventIdx[3]*pow(16,0)
+			 );
+}
+
+unsigned long CalcDataBytes(const GetHeader_t& h) {
+  int n_words =
+    (int)h.m_nItems[0]*pow(16,6) +
+    (int)h.m_nItems[1]*pow(16,4) +
+    (int)h.m_nItems[2]*pow(16,2) +
+    (int)h.m_nItems[3]*pow(16,0);
+
+  unsigned int frameSize =
+    (int)h.m_FrameSize[0]*pow(16,4) +
+    (int)h.m_FrameSize[1]*pow(16,2) +
+    (int)h.m_FrameSize[2]*pow(16,0);
+
+  int headerSize =
+    (int)h.m_HeaderSize[0]*pow(16,2) +
+    (int)h.m_HeaderSize[1]*pow(16,0);
+
+  int item_size =
+    (int)h.m_ItemSize[0]*pow(16,2) +
+    (int)h.m_ItemSize[1]*pow(16,0);
+
+  long padded = (long)(frameSize - headerSize) * 256L - (long)item_size * (long)n_words;
+  if (padded < 0) return 0;
+
+  return (unsigned long)item_size * (unsigned long)n_words + (unsigned long)padded;
+}
 
 void EventDisplay::LoadEventData(long runNum, long eventNum)
 {
   bool flag = true;
-  bool eventflag=true;
 
-  int min_lastentry = -1;
+  for (int coboNum = 0; coboNum < COBONUM; coboNum++) {
 
-  for(int coboNum = 0; coboNum<COBONUM ;coboNum++)
-    {
-      std::ifstream fin;
-      std::stringstream datafile;
-      datafile.str("");
-      datafile<<Data_dir<<"cobo"<<coboNum<<"/run_"<<std::setfill('0')<<std::setw(4)<<runNum<<".dat";
+    std::ifstream fin;
+    std::stringstream datafile;
+    datafile.str("");
+    datafile << Data_dir << "cobo" << coboNum
+             << "/run_" << std::setfill('0') << std::setw(4) << runNum << ".dat";
 
-      fin.open(datafile.str(), std::ios::in|std::ios::binary);
+    fin.open(datafile.str(), std::ios::in | std::ios::binary);
+    if (!fin.is_open()) {
+      std::cerr << "#Warning! :" << datafile.str() << " does not exist !" << std::endl;
+      continue;
+    }
 
-      if(!fin.is_open())
+    // file length
+    fin.seekg(0, fin.end);
+    unsigned long length = (unsigned long)fin.tellg();
+    if (!length) { fin.close(); continue; }
+    unsigned int lastEventId = FindLastEventId(fin, false);
+    fLastEntry = lastEventId;
+
+    fin.clear();
+    fin.seekg(12, fin.beg);
+
+    std::cout << "#D " << datafile.str() << " opened " << std::endl;
+
+
+    GetHeader_t first_header;
+    fin.read(reinterpret_cast<char*>(&first_header), sizeof(first_header));
+    if (!fin) { fin.close(); continue; }
+
+    long firstEvent =
+      (long)((int)first_header.m_EventIdx[0] * pow(16,6) +
+             (int)first_header.m_EventIdx[1] * pow(16,4) +
+             (int)first_header.m_EventIdx[2] * pow(16,2) +
+             (int)first_header.m_EventIdx[3] * pow(16,0));
+
+    long eventoffset = firstEvent;
+    long targetEventAbs = eventoffset + eventNum;
+
+
+    fin.clear();
+    fin.seekg(12, fin.beg);
+
+
+    bool inTarget = false;
+
+    while (!fin.eof() && (unsigned long)fin.tellg() < length) {
+
+      GetHeader_t get_header;
+      fin.read(reinterpret_cast<char*>(&get_header), sizeof(get_header));
+      if (!fin) break;
+
+
+      int asadId = (int)get_header.m_AsadIdx;
+
+      int n_words =
+        (int)get_header.m_nItems[0] * pow(16,6) +
+        (int)get_header.m_nItems[1] * pow(16,4) +
+        (int)get_header.m_nItems[2] * pow(16,2) +
+        (int)get_header.m_nItems[3] * pow(16,0);
+
+      long eventNumber =
+        (long)((int)get_header.m_EventIdx[0] * pow(16,6) +
+               (int)get_header.m_EventIdx[1] * pow(16,4) +
+               (int)get_header.m_EventIdx[2] * pow(16,2) +
+               (int)get_header.m_EventIdx[3] * pow(16,0));
+
+      unsigned int frameSize =
+        (int)get_header.m_FrameSize[0] * pow(16,4) +
+        (int)get_header.m_FrameSize[1] * pow(16,2) +
+        (int)get_header.m_FrameSize[2] * pow(16,0);
+
+      int headerSize =
+        (int)get_header.m_HeaderSize[0] * pow(16,2) +
+        (int)get_header.m_HeaderSize[1] * pow(16,0);
+
+      int item_size =
+        (int)get_header.m_ItemSize[0] * pow(16,2) +
+        (int)get_header.m_ItemSize[1] * pow(16,0);
+
+      long padded = (long)(frameSize - headerSize) * 256L - (long)item_size * (long)n_words;
+
+
+      if (padded < 0) {
+	std::cerr << "[ERROR] padded < 0 (sync broken?) cobo=" << coboNum
+                  << " pos=" << (unsigned long)fin.tellg() << std::endl;
+        break;
+      }
+      unsigned long dataBytes =
+        (unsigned long)item_size * (unsigned long)n_words + (unsigned long)padded;
+
+
+      if (!inTarget) {
+        if (eventNumber < targetEventAbs) {
+
+          fin.seekg((std::streamoff)dataBytes, std::ios::cur);
+          continue;
+        }
+        if (eventNumber == targetEventAbs) {
+          inTarget = true;
+	  std::cout << "=== Reading CoboNum#" << coboNum << " targetEvent=" << eventNum
+                    << " (abs " << targetEventAbs << ") ..." << std::endl;
+
+        } else {
+          break;
+        }
+      } else {
+
+        if (eventNumber != targetEventAbs) break;
+      }
+
+
+      std::cout << "asad : " << asadId << ", eventid : " << (eventNumber - eventoffset) << std::endl;
+      if( (int)get_header.m_FrameType[1]==2 ) // full
 	{
-	  std::cerr<<"#Warning! :"<< datafile.str() << " does not exist !"<<std::endl;
-	  continue;
+	  uint16_t data;
+	  int coboId = (int)get_header.m_CoboIdx;
+	  int ntb = n_words/(4*68);
+
+	  if(coboId!=coboNum)
+	    std::cout<<"#Warning! CoBo Id = "<<coboId <<" and filename "<<coboNum<<" do not match ! " <<std::endl;
+	  int count[4] = {0,0,0,0};
+	  double fadc[4][68][512]={{{0}}}; //[aget][ch][tb]
+
+	  for(int i=0;i<n_words;++i)
+	    {
+	      fin.read((char*)&data,sizeof(data));
+	      int agetid   = (data>>6)&0x03;
+	      int adc_low  = (data>>8)&0xff;
+	      int adc_high = data&0x0f;
+	      int adc      = (adc_high<<8)|adc_low;
+	      int ch       = count[agetid]%68;
+	      int t_bucket = (count[agetid]/68)%ntb;
+	      fadc[agetid][ch][t_bucket]=adc;
+	      ++count[agetid];
+	    }
+	  fin.seekg( (unsigned long)fin.tellg() + padded );
+	  int padid=0;
+	  for(int ageti = 0; ageti<4; ageti++)
+	    {
+	      for(int chi = 0; chi<68; chi++)
+		{
+		  int chi2;
+		  if(chi>=0 && chi<=10) chi2=chi;
+		  else if(chi>=12 && chi<=21) chi2 = chi-1;
+		  else if(chi>=23 && chi<=44) chi2 = chi-2;
+		  else if(chi>=46 && chi<=55) chi2 = chi-3;
+		  else if(chi>=57 && chi<=67) chi2 = chi-4;
+		  else continue;
+		  if(chi==11 || chi==22 ||chi==45||chi==56) padid=-7;
+		  else
+		    {
+		      padid=channelmap[ageti][coboNum*4+asadId][chi2];
+		    }
+		  if(padid>0)
+		    {
+		      double adcSum=0;
+		      int tbmax=0;
+		      double adcMax=-999;
+		      for(int tbi = TBMIN; tbi<ntb+TBMIN; tbi++)
+			{
+			  tbHist[padid-1]->SetBinContent(tbi+1,fadc[ageti][chi][tbi]);
+			  adcSum+=fadc[ageti][chi][tbi];
+			  if(tbi >TBCUTMIN && tbi<TBCUTMAX &&adcMax<fadc[ageti][chi][tbi])
+			    {
+			      adcMax=fadc[ageti][chi][tbi];
+			      tbmax=tbi;
+			    }
+			}
+		      TVector3 position = getPoint(padid);
+		      double offset = 15;
+
+		      double adc_height = adcMax - ((double)adcSum/ntb);
+		      poly_adc->SetBinContent(padid,adc_height);
+		      if(adc_height > threshold){
+			int maxBin = tbHist[padid-1]->GetMaximumBin();
+			float maxTime = tbHist[padid-1]->GetBinCenter(maxBin);
+			// if(maxTime > 120 || maxTime < 80) maxTime = 0;
+			poly_time->SetBinContent(padid,maxTime);
+		      }
+		      else{
+			poly_time->SetBinContent(padid,0);
+		      }
+		    }
+		}
+	    }
+	}
+      else if( (int)get_header.m_FrameType[1]==1 ) //partial
+	{
+
+	  uint32_t data;
+	  int asadId = (int)get_header.m_AsadIdx;
+	  int coboId = (int)get_header.m_CoboIdx;
+	  int ntb = n_words/(4*68);
+	  if(coboId!=coboNum)
+	    std::cout<<"#Warning! CoBo Id = "<<coboId <<" and filename "<<coboNum<<" do not match ! " <<std::endl;
+	  double fadc[4][68][TBNUM]={{{0}}}; //[aget][ch][tb]
+	  for(int i=0;i<n_words;++i)
+	    {
+	      fin.read((char*)&data,sizeof(data));
+	      int agetid  	  = (data>>6)&0x03;
+	      int adc_low 	  = (data>>24)&0xff;
+	      int adc_high 	  = (data>>16)&0x0f;
+	      int adc           = (adc_high<<8)|adc_low;
+	      int ch_low 	  = (data>>15)&0x01;
+	      int ch_high 	  = data&0x3f;
+	      int ch       	  = (ch_high<<1)|ch_low;
+	      int t_bucket_low  = (data>>22)&0x03;
+	      int t_bucket_high = (data>>8)&0x7f;
+	      int t_bucket      = (t_bucket_high<<2)|t_bucket_low;
+	      fadc[agetid][ch][t_bucket]=adc;
+#if 0
+	      std::cout << std::dec << " asad : " << coboNum*4+asadId << std::endl;
+	      std::cout << " aget : " << agetid << std::endl;
+	      std::cout << " ch : " << ch << std::endl;
+	      std::cout << " t_bucket : " << t_bucket << std::endl;
+	      std::cout << " adc : " << adc << std::hex<<  std::endl;
+	      //getchar();
+#endif
+
+	    }
+	  fin.seekg( (unsigned long)fin.tellg() + padded );
+	  int padid=0;
+	  for(int ageti = 0; ageti<4; ageti++)
+	    {
+	      for(int chi = 0; chi<68; chi++)
+		{
+		  int chi2;
+		  if(chi>=0 && chi<=10) chi2=chi;
+		  else if(chi>=12 && chi<=21) chi2 = chi-1;
+		  else if(chi>=23 && chi<=44) chi2 = chi-2;
+		  else if(chi>=46 && chi<=55) chi2 = chi-3;
+		  else if(chi>=57 && chi<=67) chi2 = chi-4;
+		  else continue;
+		  if(chi==11 || chi==22 ||chi==45||chi==56) padid=-7;
+		  else
+		    {
+		      padid=channelmap[ageti][coboNum*4+asadId][chi2];
+		    }
+		  if(padid>0)
+		    {
+		      double adcSum=0;
+		      int tbmax=0;
+		      double adcMax=-999;
+		      std::vector<double> v;
+		      for(int tbi = TBMIN; tbi<TBNUM+TBMIN; tbi++)
+			{
+			  tbHist[padid-1]->SetBinContent(tbi+1,fadc[ageti][chi][tbi]);
+			  adcSum+=fadc[ageti][chi][tbi];
+			  v.push_back(fadc[ageti][chi][tbi]);
+			  if(adcMax<fadc[ageti][chi][tbi])
+			    {
+			      adcMax=fadc[ageti][chi][tbi];
+			      tbmax=tbi;
+			    }
+			}
+		      double stddev = TMath::StdDev(v.size(), v.data());
+		      // std::cout << padid << "\t" << stddev << std::endl;
+		      // if(stddev == 0 || stddev > 50) continue;
+		      double adc_height = adcMax - ((double)adcSum/TBNUM);
+		      poly_adc->SetBinContent(padid,adc_height);
+		      if(adc_height > threshold){
+			int maxBin = tbHist[padid-1]->GetMaximumBin();
+			float maxTime = tbHist[padid-1]->GetBinCenter(maxBin);
+			// if(maxTime > 120 || maxTime < 80) maxTime = 0;
+			poly_time->SetBinContent(padid,maxTime);
+		      }
+		      else{
+			poly_time->SetBinContent(padid,0);
+		      }
+		    }
+		}
+	    }
 	}
       else
 	{
-	  std::cout << "#D " << datafile.str() << " opened " <<std::endl;
+	  std::cerr<<"#E : FrameType error !, FrameType="<<(int)get_header.m_FrameType[1] <<
+	    " cobo : " << coboNum << " asad : " << asadId << std::endl;
+	  continue;
 	}
 
-      fin.seekg(0, fin.end);
-      unsigned long length = fin.tellg();
-
-      fin.seekg(0, fin.beg);
-      fin.seekg(12);
-
-      if(!length) continue;
-      min_lastentry = (length - 12) / (Header_Size + Data_Size) / ((coboNum == 7)? ASADNUM -1 : ASADNUM)-1;
-      if(min_lastentry < fLastEntry)fLastEntry = min_lastentry;
-
-      for(int asadNum = 0; asadNum<((coboNum == 7)? ASADNUM -1 : ASADNUM) ;asadNum++)
-	// for(int asadNum = 1; asadNum<((coboNum == 3)? 2 : 1) ;asadNum++)
-	{
-	  int asadId;
-	  struct GetHeader_t get_header;
-	  int n_words;
-	  int padded;
-	  while(!fin.eof() && (unsigned long)fin.tellg()<length)
-	    {
-	      // Read Header
-	      fin.read((char*)&get_header,sizeof(get_header));
-#if DEBUG
-	      std::cout << "now : " << std::hex << (unsigned long)fin.tellg() << std::endl;
-	      std::cout << std::endl;
-	      //getchar();
-#endif
-
-	      asadId = (int)get_header.m_AsadIdx;
-	      n_words = (int)get_header.m_nItems[0]*pow(16,6)
-		+(int)get_header.m_nItems[1]*pow(16,4)
-		+(int)get_header.m_nItems[2]*pow(16,2)
-		+(int)get_header.m_nItems[3]*pow(16,0);
-
-	      long eventNumber = (long)((int)get_header.m_EventIdx[0]*pow(16,6)
-					+(int)get_header.m_EventIdx[1]*pow(16,4)
-					+(int)get_header.m_EventIdx[2]*pow(16,2)
-					+(int)get_header.m_EventIdx[3]*pow(16,0));
-
-	      unsigned int frameSize = (int)get_header.m_FrameSize[0]*pow(16,4)
-		+(int)get_header.m_FrameSize[1]*pow(16,2)
-		+(int)get_header.m_FrameSize[2]*pow(16,0);
-
-	      int headerSize = (int)get_header.m_HeaderSize[0]*pow(16,2)
-		+(int)get_header.m_HeaderSize[1]*pow(16,0);
-	      int item_size = (int)get_header.m_ItemSize[0]*pow(16,2)
-		+(int)get_header.m_ItemSize[1]*pow(16,0);
-
-	      if(eventflag) {
-		eventoffset=eventNumber;
-		eventflag=false;
-	      }
-
-	      padded = (frameSize-headerSize)*256 - item_size*n_words;
-
-#if DEBUG
-	      std::cout << std::hex << std::setfill('0') << std::endl;
-	      std::cout << " ==========================================" << std::endl;
-	      std::cout << " frameSize  3B : " << std::setw(2) <<
-		(int)get_header.m_FrameSize[0] << " " << std::setw(2) <<
-		(int)get_header.m_FrameSize[1] << " " << std::setw(2) <<
-		(int)get_header.m_FrameSize[2] << std::endl;
-	      std::cout << " eventIdx   4B : " << std::setw(2) <<
-		(int)get_header.m_EventIdx[0] << " " << std::setw(2) <<
-		(int)get_header.m_EventIdx[1] << " " << std::setw(2) <<
-		(int)get_header.m_EventIdx[2] << " " << std::setw(2) <<
-		(int)get_header.m_EventIdx[3] << " --> " << std::dec << eventNumber << std::endl;
-	      std::cout << " coboIdx    1B : " << std::setw(2) << (int)get_header.m_CoboIdx << std::endl;
-	      std::cout << " asadIdx    1B : " << std::setw(2) << (int)get_header.m_AsadIdx << std::endl;
-	      std::cout << " frameType     : " << (int)get_header.m_FrameType[1] << std::endl;
-	      std::cout << " itemSize   : " << item_size << std::endl;
-	      std::cout << " nItems     : " << n_words << std::endl;
-	      std::cout << " padded     : " << padded << std::endl;
-	      std::cout << " ==========================================" << std::endl;
-	      //getchar();
-#endif
-
-
-	      if(eventNumber-eventoffset == eventNum)
-		{
-		  cout << "=== Reading CoboNum#" << coboNum << ", Asad#" << asadId << "..."<<endl;
-		  //getchar();
-		  break;
-		}
-	      else {
-		fin.seekg( (unsigned long)fin.tellg() + (unsigned long)(frameSize-headerSize)*256);
-	      }
-	    }
-
-	  // Read Data
-	  if( (int)get_header.m_FrameType[1]==2 ) // full
-	    {
-	      uint16_t data;
-	      int coboId = (int)get_header.m_CoboIdx;
-	      int ntb = n_words/(4*68);
-
-	      if(coboId!=coboNum)
-		std::cout<<"#Warning! CoBo Id = "<<coboId <<" and filename "<<coboNum<<" do not match ! " <<std::endl;
-	      int count[4] = {0,0,0,0};
-	      double fadc[4][68][512]={{{0}}}; //[aget][ch][tb]
-
-	      for(int i=0;i<n_words;++i)
-		{
-		  fin.read((char*)&data,sizeof(data));
-		  int agetid   = (data>>6)&0x03;
-		  int adc_low  = (data>>8)&0xff;
-		  int adc_high = data&0x0f;
-		  int adc      = (adc_high<<8)|adc_low;
-		  int ch       = count[agetid]%68;
-		  int t_bucket = (count[agetid]/68)%ntb;
-		  fadc[agetid][ch][t_bucket]=adc;
-		  ++count[agetid];
-		}
-	      fin.seekg( (unsigned long)fin.tellg() + padded );
-	      int padid=0;
-	      for(int ageti = 0; ageti<4; ageti++)
-		{
-		  for(int chi = 0; chi<68; chi++)
-		    {
-		      int chi2;
-		      if(chi>=0 && chi<=10) chi2=chi;
-		      else if(chi>=12 && chi<=21) chi2 = chi-1;
-		      else if(chi>=23 && chi<=44) chi2 = chi-2;
-		      else if(chi>=46 && chi<=55) chi2 = chi-3;
-		      else if(chi>=57 && chi<=67) chi2 = chi-4;
-		      else continue;
-		      if(chi==11 || chi==22 ||chi==45||chi==56) padid=-7;
-		      else
-			{
-			  padid=channelmap[ageti][coboNum*4+asadId][chi2];
-			}
-		      if(padid>0)
-			{
-			  double adcSum=0;
-			  int tbmax=0;
-			  double adcMax=-999;
-			  for(int tbi = TBMIN; tbi<ntb+TBMIN; tbi++)
-			    {
-			      tbHist[padid-1]->SetBinContent(tbi+1,fadc[ageti][chi][tbi]);
-			      adcSum+=fadc[ageti][chi][tbi];
-			      if(tbi >TBCUTMIN && tbi<TBCUTMAX &&adcMax<fadc[ageti][chi][tbi])
-				{
-				  adcMax=fadc[ageti][chi][tbi];
-				  tbmax=tbi;
-				}
-			    }
-			  TVector3 position = getPoint(padid);
-			  double offset = 15;
-
-			  double adc_height = adcMax - ((double)adcSum/ntb);
-			  poly_adc->SetBinContent(padid,adc_height);
-			  if(adc_height > threshold){
-			    int maxBin = tbHist[padid-1]->GetMaximumBin();
-			    float maxTime = tbHist[padid-1]->GetBinCenter(maxBin);
-			    // if(maxTime > 120 || maxTime < 80) maxTime = 0;
-			    poly_time->SetBinContent(padid,maxTime);
-			  }
-			  else{
-			    poly_time->SetBinContent(padid,0);
-			  }
-			}
-		    }
-		}
-	    }
-	  else if( (int)get_header.m_FrameType[1]==1 ) //partial
-	    {
-
-	      uint32_t data;
-	      int asadId = (int)get_header.m_AsadIdx;
-	      int coboId = (int)get_header.m_CoboIdx;
-	      int ntb = n_words/(4*68);
-	      if(coboId!=coboNum)
-		std::cout<<"#Warning! CoBo Id = "<<coboId <<" and filename "<<coboNum<<" do not match ! " <<std::endl;
-	      double fadc[4][68][TBNUM]={{{0}}}; //[aget][ch][tb]
-	      for(int i=0;i<n_words;++i)
-		{
-		  fin.read((char*)&data,sizeof(data));
-		  int agetid  	  = (data>>6)&0x03;
-		  int adc_low 	  = (data>>24)&0xff;
-		  int adc_high 	  = (data>>16)&0x0f;
-		  int adc           = (adc_high<<8)|adc_low;
-		  int ch_low 	  = (data>>15)&0x01;
-		  int ch_high 	  = data&0x3f;
-		  int ch       	  = (ch_high<<1)|ch_low;
-		  int t_bucket_low  = (data>>22)&0x03;
-		  int t_bucket_high = (data>>8)&0x7f;
-		  int t_bucket      = (t_bucket_high<<2)|t_bucket_low;
-		  fadc[agetid][ch][t_bucket]=adc;
-#if DEBUG
-		  std::cout << std::dec << " asad : " << coboNum*4+asadId << std::endl;
-		  std::cout << " aget : " << agetid << std::endl;
-		  std::cout << " ch : " << ch << std::endl;
-		  std::cout << " t_bucket : " << t_bucket << std::endl;
-		  std::cout << " adc : " << adc << std::hex<<  std::endl;
-		  //getchar();
-#endif
-
-		}
-	      fin.seekg( (unsigned long)fin.tellg() + padded );
-	      int padid=0;
-	      for(int ageti = 0; ageti<4; ageti++)
-		{
-		  for(int chi = 0; chi<68; chi++)
-		    {
-		      int chi2;
-		      if(chi>=0 && chi<=10) chi2=chi;
-		      else if(chi>=12 && chi<=21) chi2 = chi-1;
-		      else if(chi>=23 && chi<=44) chi2 = chi-2;
-		      else if(chi>=46 && chi<=55) chi2 = chi-3;
-		      else if(chi>=57 && chi<=67) chi2 = chi-4;
-		      else continue;
-		      if(chi==11 || chi==22 ||chi==45||chi==56) padid=-7;
-		      else
-			{
-			  padid=channelmap[ageti][coboNum*4+asadId][chi2];
-			}
-		      if(padid>0)
-			{
-			  double adcSum=0;
-			  int tbmax=0;
-			  double adcMax=-999;
-			  std::vector<double> v;
-			  for(int tbi = TBMIN; tbi<TBNUM+TBMIN; tbi++)
-			    {
-			      tbHist[padid-1]->SetBinContent(tbi+1,fadc[ageti][chi][tbi]);
-			      adcSum+=fadc[ageti][chi][tbi];
-			      v.push_back(fadc[ageti][chi][tbi]);
-			      if(adcMax<fadc[ageti][chi][tbi])
-				{
-				  adcMax=fadc[ageti][chi][tbi];
-				  tbmax=tbi;
-				}
-			    }
-			  double stddev = TMath::StdDev(v.size(), v.data());
-			  // std::cout << padid << "\t" << stddev << std::endl;
-			  // if(stddev == 0 || stddev > 50) continue;
-			  double adc_height = adcMax - ((double)adcSum/TBNUM);
-			  poly_adc->SetBinContent(padid,adc_height);
-			  if(adc_height > threshold){
-			    int maxBin = tbHist[padid-1]->GetMaximumBin();
-			    float maxTime = tbHist[padid-1]->GetBinCenter(maxBin);
-			    // if(maxTime > 120 || maxTime < 80) maxTime = 0;
-			    poly_time->SetBinContent(padid,maxTime);
-			  }
-			  else{
-			    poly_time->SetBinContent(padid,0);
-			  }
-			}
-		    }
-		}
-	    }
-	  else
-	    {
-	      std::cerr<<"#E : FrameType error !, FrameType="<<(int)get_header.m_FrameType[1] <<
-		" cobo : " << coboNum << " asad : " << asadId << std::endl;
-	      //exit(-1);
-	      continue;
-	    }
-
-	}
-      fin.close();
     }
 
-#if 0
-  for(int i=0; i<padArray->GetEntries(); i++)
-    {
-      auto pad = (S2Pad*)padArray->At(i);
-      if(pad->GetPadID()==-7) continue;
-      //cout << " cobo " << coboNum <<", asad " << asadNum << ", padID : " << pad->GetPadID() << endl;
-      //getchar();
-      adc = pad->GetADC();
-      //if(pad->GetPadID()==3814) cout << " adc[4]" << adc[4] << endl;
-      double adcSum=0;
-      int tbmax=0;
-      double adcMax=-999;
-      //for(int tbi = 80; tbi<120; tbi++)
-      //cout <<  " padid : " << pad->GetPadID() << endl;
-      //getchar();
-      for(int tbi = 0; tbi<512; tbi++)
-	//for(int tbi = 50; tbi<480; tbi++)
-	{
-	  //cout << " adc " << adc[tbi] << endl;
-	  tbHist[pad->GetPadID()-1]->SetBinContent(tbi+1,adc[tbi]);
-	  //cout << "tbi="<< tbi << " adc " << adc[tbi] << endl;
-	  //sleep(1);
-	  adcSum+=adc[tbi];
-	  if(adcMax<adc[tbi])
-	    {
-	      adcMax=adc[tbi];
-	      tbmax=tbi;
-	    }
-	}
-      TVector3 pos = getPoint(pad->GetPadID());
-      pos.SetY(tbmax*40*0.001*53-225);
-      double y = pos.Y();
-      double z = pos.Z();
-      if(pad->GetPadID()>0 && adcMax>0)
-	{
-	  poly_adc->SetBinContent(pad->GetPadID(),adcMax-(adcSum/512.));
-	  flag = false;
-	}
-    }
-  padArray->Clear();
-#endif
+    fin.close();
+  }
 
+  std::cout << " * Finished * runNum : " << runNum << " eventNum : " << eventNum << std::endl;
 }
+
 
 void EventDisplay::ShowPulse()
 {
@@ -674,7 +772,10 @@ void EventDisplay::ShowPulse()
   if (binIdx < 0 || binIdx >= PADNUM) return;
 
   tbHist[binIdx]->SetMaximum(4000);
-  tbHist[binIdx]->SetTitle(Form("Pad : %d;Time Bucket;ADC [ch]",binIdx));
+  Int_t layerIdx = getLayerID(binIdx);
+  Int_t rowIdx = getRowID(binIdx);
+  auto asadIdx = GetASADId(layerIdx, rowIdx);
+  tbHist[binIdx]->SetTitle(Form("Pad : %d (AsAd : %d);Time Bucket;ADC [ch]",binIdx,asadIdx+1));
   gStyle->SetOptStat("eMR");
   tbHist[binIdx]->Draw("hist");
   fCanvas->Update();
@@ -707,6 +808,15 @@ void EventDisplay::GoForward(){
     {
       fCurrentEvent++;
     }
+
+  LoadEventData(runNumber, fCurrentEvent);
+  DoCanvasDraw();
+}
+
+void EventDisplay::GoLast(){
+  fCanvas->Clear("D");
+
+  fCurrentEvent = fLastEntry;
 
   LoadEventData(runNumber, fCurrentEvent);
   DoCanvasDraw();
