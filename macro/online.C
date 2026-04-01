@@ -68,7 +68,7 @@ class EventDisplay {
   int channelmap[4][31][68];
   bool asad_status[8][4];
   long eventoffset;
-  Int_t fLastEntry = 1000000;
+  Int_t fLastEntry = -1;
 
 
 
@@ -346,6 +346,17 @@ uint32_t EventDisplay::FindLastEventId(std::ifstream& fin, bool verbose=false) {
   fin.clear();
   fin.seekg(12, std::ios::beg);
 
+  GetHeader_t h;
+  fin.read(reinterpret_cast<char*>(&h), sizeof(h));
+
+  const uint32_t firsteventNumber = (uint32_t)h.m_EventIdx[0] * (uint32_t)std::pow(16, 6)
+    + (uint32_t)h.m_EventIdx[1] * (uint32_t)std::pow(16, 4)
+    + (uint32_t)h.m_EventIdx[2] * (uint32_t)std::pow(16, 2)
+    + (uint32_t)h.m_EventIdx[3] * (uint32_t)std::pow(16, 0);
+
+
+  fin.seekg(12, std::ios::beg);
+
   uint32_t lastEvent = 0;
   size_t nrec = 0;
 
@@ -356,6 +367,7 @@ uint32_t EventDisplay::FindLastEventId(std::ifstream& fin, bool verbose=false) {
 
     GetHeader_t h;
     fin.read(reinterpret_cast<char*>(&h), sizeof(h));
+
     if (!fin) break;
 
     const auto s = calcSkipFromHeader(h);
@@ -367,7 +379,7 @@ uint32_t EventDisplay::FindLastEventId(std::ifstream& fin, bool verbose=false) {
       break;
     }
 
-    lastEvent = s.eventId;
+    lastEvent = s.eventId - firsteventNumber;
     ++nrec;
 
     fin.seekg((std::streamoff)s.dataBytes, std::ios::cur);
@@ -772,6 +784,7 @@ void EventDisplay::ShowPulse()
   if (binIdx < 0 || binIdx >= PADNUM) return;
 
   tbHist[binIdx]->SetMaximum(4000);
+  //tbHist[binIdx]->SetMaximum(650);
   Int_t layerIdx = getLayerID(binIdx);
   Int_t rowIdx = getRowID(binIdx);
   auto asadIdx = GetASADId(layerIdx, rowIdx);
@@ -807,7 +820,7 @@ void EventDisplay::GoForward(){
   else
     {
       fCurrentEvent++;
-    }
+  }
 
   LoadEventData(runNumber, fCurrentEvent);
   DoCanvasDraw();
@@ -816,10 +829,16 @@ void EventDisplay::GoForward(){
 void EventDisplay::GoLast(){
   fCanvas->Clear("D");
 
-  fCurrentEvent = fLastEntry;
+  if(fLastEntry == -1){
+    cout<<"No Updated Event"<<endl;
+  }
+  else
+    {
+      fCurrentEvent = fLastEntry;
 
-  LoadEventData(runNumber, fCurrentEvent);
-  DoCanvasDraw();
+      LoadEventData(runNumber, fCurrentEvent);
+      DoCanvasDraw();
+    }
 }
 
 void EventDisplay::GoTo(){
@@ -852,7 +871,7 @@ void EventDisplay::DoCanvasDraw(){
   poly_adc->SetMinimum(0);
   poly_adc->SetStats(false);
   poly_adc->SetTitle(Form("Pulse Height | Run%d Event : %d;Z [mm];X [mm]",runNumber,fCurrentEvent));
-  poly_adc->GetZaxis()->SetRangeUser(0, 1000);
+  //poly_adc->GetZaxis()->SetRangeUser(0, 1000);
   poly_adc->Draw("colz");
 
   fCanvas->cd(2);
